@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import time
+import curses
+import traceback
+import multiprocessing
+
+VIEW_USAGE = "%CPU"
+VIEW_SHARES = "SHARES"
+VIEW_NTASKS = "NTASKS"
+
+ORDER_NAME = "NAME"
+ORDER_INFO = "INFO"
+
+CFS_RE = re.compile("cfs_rq\[(\d+)\]:/([^\n]*)")
+
+max_level = 9
+level_width = 2
+name_width = 12
+info_width = 8
+cell_width = 7
+
+task_groups = dict()
+cpu_count = multiprocessing.cpu_count()
+
+class ExternalError(Exception):
+    pass
+
+def pct(x):
+    return str(int(x*100+0.5))
+
+class TaskGroup:
+    def __init__(self, path):
+        self.path = path
+        self.name = path.rsplit("/", 1)[-1]
+        if path == "":
+            self.name = "root"
+        self.level = 0
+        self.children = []
+
+        self.timestamp = None
+        self.pcpu_time = [None] * cpu_count
+        self.cpu_shares = None
+        self.pcpu_weight = [None] * cpu_count
+
+        self.usage = "-"
+        self.pcpu_usage = ["-"] * cpu_count
+        self.shares = cpu_count
+        self.pcpu_shares = ["-"] * cpu_count
+        self.ntasks = "-"
+        self.pcpu_ntasks = ["-"] * cpu_count
+
+    def is_root(self):
+        return self.name == "root"
+
+    def add_child(self, child):
+        if self.level == max_level:
+            print("max_level reached, ignored %s" % child.path)
+            return
+
+        child.level = self.level + 1
+        self.children.append(child)
+
+    def update_usage(self):
+        base = "/sys/fs/cgroup/cpuacct"
+        path = "/".join([base, self.path, "cpuacct.usage_percpu"])
+        with open(path) as f:
+            pcpu_time = [int(x) for x in f.read().split()]
+
+        timestamp = int(time.time() * 10**9)
+        pcpu_usage = [0] * cpu_count
+        if self.timestamp is not None:
+            delta = timestamp - self.timestamp
+            if delta == 0:
+                delta = 1
+            for i in range(cpu_count):
+                usage = pcpu_time[i] - self.pcpu_time[i]
+                if usage > delta:
+                    usage = delta
+                pcpu_usage[i] = usage / delta
+
+        self.timestamp = timestamp
+        self.pcpu_time = pcpu_time
+
+        usage = sum(pcpu_usage)
+        if usage == 0:
+            usage = 0.00001
+        self.usage = usage
+        self.pcpu_usage = ["%s/%s" % (pct(x), pct(x/usage)) for x in pcpu_usage]
+
+    def update_ntasks(self):
+        base = "/sys/fs/cgroup/cpu"
+        path = "/".join([base, self.path, "tasks"])
+        with open(path) as f:
+            self.ntasks = len(f.read().splitlines())
+
+    def update_cpu_shares(self):
+        base = "/sys/fs/cgroup/cpu"
+        path = "/".join([base, self.path, "cpu.shares"])
+        with open(path) as f:
+            self.cpu_shares = int(f.read())
+
+    def update_pcpu_weight(self, cpu, cfs_info):
+        for line in cfs_info.splitlines():
+            fields = line.split()
+            if fields[0] == ".se->load.weight":
+                self.pcpu_weight[cpu] = int(fields[2])
+
+    def calc_shares(self, parent_shares, sibling_cpu_shares):
+        self.shares = parent_shares * self.cpu_shares / sibling_cpu_shares
+
+    def reset_pcpu_shares(self):
+        self.pcpu_shares = ["-"] * cpu_count
+
+    def update_stats(self):
+        self.reset_pcpu_shares()
+        self.update_usage()
+        self.update_cpu_shares()
+        self.update_ntasks()
+
+    def name(self):
+        return self.name
+
+    def usage(self):
+        return pct(self.usage)
+
+    def pcpu_usage(self, cpu):
+        return self.pcpu_usage[cpu]
+
+    def shares(self):
+        return pct(self.shares)
+
+    def pcpu_shares(self, cpu):
+        return self.pcpu_shares[cpu]
+
+    def ntasks(self):
+        return self.ntasks
+
+    def pcpu_ntasks(self, cpu):
+        return self.pcpu_ntasks[cpu]
+
+def parse_sched_debug():
+    with open("/proc/sched_debug") as f:
+        for section in f.read().split("\n\n"):
+            mo = CFS_RE.match(section)
+            if mo is not None:
+                cpu, name = mo.groups()
+                group = task_groups.get(name)
+                if group is not None:
+                    group.update_pcpu_weight(int(cpu), section)
+
+def update_task_groups():
+    global task_groups
+
+    base = "/sys/fs/cgroup/cpu"
+    base_len = len(base)
+
+    new_task_groups = dict()
+    for root, _, _ in os.walk(base):
+        path = root[len(base):]
+        group = task_groups.get(path)
+        if group is None:
+            group = TaskGroup(path)
+            if not group.is_root():
+                parts = path.rsplit("/", 1)
+                parent = new_task_groups[parts[0]]
+                parent.add_child(group)
+
+        group.update_stats()
+        new_task_groups[path] = group
+
+    task_groups = new_task_groups
+
+def calc_children_shares(group):
+    children_cpu_shares = sum(x.cpu_shares for x in group.children)
+    for child in group.children:
+        child.calc_shares(group.shares, children_cpu_shares)
+        calc_children_shares(child)
+
+def get_sys_stats():
+    with open("/proc/loadavg") as f:
+        fields = f.read().split()
+        return {
+            "load_avg": " ".join(fields[0:3]),
+            "ntasks": fields[3],
+        }
+
+def iter_task_groups(group, info_f, cell_f, order):
+    line = "{0:<{width}}".format(group.level, width=level_width)
+    line += "{0:{width}}".format(group.name[:name_width], width=name_width)
+    line += "{0:{width}}".format(info_f(group), width=info_width)
+    for i in range(cpu_count):
+        line += "{0:>{width}}".format(cell_f(group, i), width=cell_width)
+    yield line
+
+    if order == ORDER_INFO:
+        key_f = info_f
+    else:
+        key_f = TaskGroup.name
+
+    for child in sorted(group.children, key=key_f, reverse=True):
+        yield from iter_task_groups(child, info_f, cell_f, order)
+
+class Display:
+    def __init__(self, app, interval):
+        self.app = app
+
+        self.data = None
+        self.header = ""
+        self.tail = ""
+        self.lines = []
+
+        self.view = VIEW_USAGE
+        self.order = ORDER_INFO
+        self.frozen = False
+        self.mark_pos = 0
+        self.view_pos = 0
+        self.height = 0
+        self.width = 0
+
+        self.last_update = 0
+        self.interval = interval
+        halfdelay = interval * 5
+        if halfdelay < 1:
+            halfdelay = 1
+        if halfdelay > 255:
+            halfdelay = 255
+
+        self.stdscr = curses.initscr()
+        curses.noecho();
+        curses.curs_set(0)
+        curses.halfdelay(halfdelay)
+        self.stdscr.keypad(1)
+        self.stdscr.move(0, 0)
+
+    def should_update(self):
+        now = time.time()
+        return now - self.last_update > self.interval
+
+    def update_data(self):
+        self.data = self.app.get_stats()
+        self.last_update = time.time()
+
+    def update_content(self):
+        sys_stats, root_tg = self.data
+
+        header = "{0:{width}}".format("L", width=level_width)
+        header += "{0:{width}}".format("GROUP", width=name_width)
+        header += "{0:{width}}".format(self.view, width=info_width)
+        for i in range(cpu_count):
+            header += "{0:>{width}}".format("CPU%d" % i, width=cell_width)
+        self.header = header
+
+        tail = time.strftime("%H:%M:%S")
+        tail += " | " + "Ntasks: " + sys_stats["ntasks"]
+        tail += " | " + "Load avg: " + sys_stats["load_avg"]
+        tail += " | " + "View: " + self.view
+        if self.frozen:
+            tail += " | Frozen"
+        self.tail = tail
+
+        if self.view == VIEW_USAGE:
+            info_f = TaskGroup.usage
+            cell_f = TaskGroup.pcpu_usage
+        elif self.view == VIEW_SHARES:
+            info_f = TaskGroup.shares
+            cell_f = TaskGroup.pcpu_shares
+        else:
+            info_f = TaskGroup.ntasks
+            cell_f = TaskGroup.pcpu_ntasks
+
+        self.lines = list(iter_task_groups(root_tg, info_f, cell_f, self.order))
+
+    def cleanup(self):
+        self.stdscr.keypad(0)
+        curses.nocbreak()
+        curses.echo()
+        curses.endwin()
+
+    def run(self):
+        self.update_data()
+        self.update_content()
+        self.resize()
+
+        while True:
+            key = self.stdscr.getch()
+            if key in [curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
+                       curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END]:
+                self.redraw(key)
+            elif key == curses.KEY_RESIZE:
+                self.resize()
+            elif key == ord(">"):
+                self.order = ORDER_INFO
+                self.update_content()
+                self.redraw()
+            elif key == ord("<"):
+                self.order = ORDER_NAME
+                self.update_content()
+                self.redraw()
+            elif key == ord("c") or key == ord("C"):
+                self.view = VIEW_USAGE
+                self.update_content()
+                self.redraw()
+            elif key == ord("s") or key == ord("S"):
+                self.view = VIEW_SHARES
+                self.update_content()
+                self.redraw()
+            elif key == ord("n") or key == ord("N"):
+                self.view = VIEW_NTASKS
+                self.update_content()
+                self.redraw()
+            elif key == ord("f") or key == ord("F"):
+                self.frozen = not self.frozen
+                self.update_content()
+                self.redraw()
+            elif key == ord("q") or key == ord("Q"):
+                break
+
+            if not self.frozen and self.should_update():
+                self.update_data()
+                self.update_content()
+                self.redraw()
+
+    def resize(self):
+        self.height, self.width = self.stdscr.getmaxyx()
+        self.redraw()
+
+    def addline(self, line, attr=curses.A_NORMAL):
+        line = "{0:{width}}".format(line, width=self.width)
+        try:
+            self.stdscr.move(self.cursor_y, 0)
+            self.stdscr.addnstr(line, self.width, attr)
+            self.stdscr.clrtoeol()
+            self.cursor_y += 1
+        except curses.error:
+            pass
+
+    def redraw(self, key=None):
+        self.cursor_y = 0
+        self.addline(self.header, attr=curses.A_REVERSE|curses.A_BOLD)
+
+        doc_size = len(self.lines)
+        view_height = self.height - self.cursor_y - 1
+        if doc_size > 0 and view_height > 0:
+            if key == curses.KEY_UP:
+                self.mark_pos -= 1
+            elif key == curses.KEY_DOWN:
+                self.mark_pos += 1
+            elif key == curses.KEY_PPAGE:
+                self.mark_pos -= view_height
+                self.view_pos -= view_height
+            elif key == curses.KEY_NPAGE:
+                self.mark_pos += view_height
+                self.view_pos += view_height
+            elif key == curses.KEY_HOME:
+                self.view_pos = 0
+                self.mark_pos = 0
+            elif key == curses.KEY_END:
+                self.view_pos = doc_size - 1
+                self.mark_pos = doc_size - 1
+
+            if self.mark_pos < 0:
+                self.mark_pos = 0
+            elif self.mark_pos >= doc_size:
+                self.mark_pos = doc_size - 1
+            if self.view_pos > doc_size - view_height:
+                self.view_pos = doc_size - view_height
+            if self.view_pos < 0:
+                self.view_pos = 0
+            if self.view_pos > self.mark_pos:
+                self.view_pos = self.mark_pos
+            elif self.view_pos < self.mark_pos - view_height + 1:
+                self.view_pos = self.mark_pos - view_height + 1
+
+            for line in self.lines[self.view_pos:self.view_pos + view_height]:
+                attr = curses.A_NORMAL
+                if line == self.lines[self.mark_pos]:
+                    attr = curses.A_BOLD
+                self.addline(line, attr)
+
+        self.stdscr.clrtobot()
+        self.cursor_y = self.height - 1
+        self.addline(self.tail, attr=curses.A_REVERSE|curses.A_BOLD)
+        self.stdscr.refresh()
+
+class App:
+    def __init__(self, args):
+        sys.stdout = open(args.log, "w", buffering=1)
+
+        display = Display(self, args.interval)
+        try:
+            display.run()
+        finally:
+            display.cleanup()
+
+    def get_stats(self):
+        sys_stats = get_sys_stats()
+        update_task_groups()
+        parse_sched_debug()
+        calc_children_shares(task_groups[""])
+        return (sys_stats, task_groups[""])
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Task group top")
+    parser.add_argument("--interval", type=int, default=1,
+                        help="refresh interval in seconds, default is 1")
+    parser.add_argument("--log", default="/tmp/tgtop.log",
+                        help="write debug to file")
+    args = parser.parse_args()
+
+    try:
+        App(args)
+    except KeyboardInterrupt:
+        sys.exit(2)
+    except ExternalError as e:
+        sys.stderr.write(str(e)+"\n")
+        sys.exit(-1)
+    except Exception as e:
+        sys.stderr.write("-" * 60 + "\n")
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.write("-" * 60 + "\n")
+        sys.stderr.write("You just found a bug, please send above message to the author.\n")
+        sys.exit(-2)
