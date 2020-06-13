@@ -4,23 +4,87 @@ import os
 import re
 import time
 import curses
+import shutil
 import traceback
 import multiprocessing
+from collections import defaultdict
+
+HELP_TEXT = """Views:
+
+Each view shows group name, group stats, and per-CPU stats.
+3 views are available:
+
+1-%CPU:
+    group stats: total CPU usage of the group
+    per-CPU stats x/y:
+        x: group usage on this CPU
+        y: percent of this CPU usage to total group usage
+2-SHARES:
+    group stats: cpu.share of the group
+    per-CPU stats x/y:
+        x: percent of entity weight to cfs_rq weight on this CPU
+        y: percent of entity weight to total group weight
+3-NTASKS:
+    group stats: number of tasks directly belong to this group
+    per-CPU stats x/y:
+        x: number of group running tasks on this CPU
+        y: number of group tasks on this CPU
+
+Keys:
+    UP:         move cursor up
+    DOWN:       move cursor down
+    PAGE_UP:    move cursor one page up
+    PAGE_DOWN:  move cursor one page down
+    HOME:       move cursor to the begining
+    END:        move cursor to the end
+    <:          sort with prev column
+    >:          sort with next column
+    TAB:        fold row under the cursor
+    u:          unfold all
+    n:          next view
+    p:          prev view
+    1-3:        i-th view
+    f:          toggle freezing screen
+    h:          show help
+    q:          quit
+
+Press any key to exit help.
+"""
 
 VIEW_USAGE = "%CPU"
 VIEW_SHARES = "SHARES"
 VIEW_NTASKS = "NTASKS"
 
-ORDER_NAME = "NAME"
-ORDER_INFO = "INFO"
+views = [
+    VIEW_USAGE,
+    VIEW_SHARES,
+    VIEW_NTASKS,
+]
 
-CFS_RE = re.compile("cfs_rq\[(\d+)\]:/([^\n]*)")
+CFS_RE = re.compile("cfs_rq\[(?P<cpu>\d+)\]:(?P<path>[^\n]*)")
+TASKS_PREFIX = "runnable tasks:"
 
-max_level = 9
+# 0-9 a-z
+MAX_LEVEL = 10 + 26
+
+def level_fold(group):
+    if group.level < 10:
+        s = str(group.level)
+    else:
+        s = chr(ord('a')+group.level-10)
+    if group.fold:
+        s += "+"
+    else:
+        s += "-"
+    return s
+
 level_width = 2
 name_width = 12
 info_width = 8
 cell_width = 7
+
+log_file = "/tmp/tgtop.log"
+tmp_sched_debug = "/tmp/tgtop_sched_debug"
 
 task_groups = dict()
 cpu_count = multiprocessing.cpu_count()
@@ -28,156 +92,318 @@ cpu_count = multiprocessing.cpu_count()
 class ExternalError(Exception):
     pass
 
-def pct(x):
-    return str(int(x*100+0.5))
+def chroot_path(path, base):
+    path = path[len(base):]
+    if path == "":
+        return "/"
+    return path
+
+def basename(path):
+    if path == "/":
+        return "/"
+    if path[-1] == "/":
+        path = path[:-1]
+    return path.rsplit("/", 1)[-1]
+
+def dirname(path):
+    return os.path.dirname(path)
+
+def percent(numer, denom):
+    if denom is None:
+        return None
+    if denom == 0:
+        return 0
+    if numer >= denom:
+        return 100
+    return int(numer * 100 / denom + 0.5)
+
+class Window:
+    def __init__(self, doc_height, win_height, top, mark):
+        self.doc_height = doc_height
+        self.win_height = win_height
+        self.top = top
+        self.mark = mark
+        self.bottom = None
+
+    def _set_top(self):
+        self.top = self.bottom - self.win_height
+        if self.top < 0:
+            self.top = 0
+
+    def _set_bottom(self):
+        self.bottom = self.top + self.win_height
+
+    def refit(self):
+        self._set_bottom()
+        if self.top > self.mark:
+            self.top = self.mark
+            self._set_bottom()
+        elif self.bottom < self.mark:
+            self.bottom = self.mark + 1
+            self._set_top()
+
+    def key_up(self):
+        if self.mark > 0:
+            self.mark -= 1
+            self.refit()
+
+    def key_down(self):
+        if self.mark < self.doc_height - 1:
+            self.mark += 1
+            self.refit()
+
+    def key_home(self):
+        self.mark = 0
+        self.refit()
+
+    def key_end(self):
+        self.mark = self.doc_height - 1
+        self.refit()
+
+    def key_ppage(self):
+        self.refit()
+        if self.top > 0:
+            self.top -= self.win_height - 1
+            if self.top < 0:
+                self.top = 0
+            self._set_bottom()
+
+            self.mark -= self.win_height - 1
+            if self.mark < 0:
+                self.mark = 0
+
+    def key_npage(self):
+        self.refit()
+        if self.bottom < self.doc_height:
+            self.bottom += self.win_height - 1
+            self._set_top()
+
+            self.mark += self.win_height - 1
+            if self.mark > self.doc_height -1:
+                self.mark = self.doc_height -1
 
 class TaskGroup:
     def __init__(self, path):
         self.path = path
-        self.name = path.rsplit("/", 1)[-1]
-        if path == "":
-            self.name = "root"
+        self.name = basename(path)
+        self.fold = False
+
+        self.last_timestamp = None
+        self.last_pcpu_time = [None] * cpu_count
+
+        self.reset()
+
+    def reset(self):
         self.level = 0
         self.children = []
+        self.parent = None
 
-        self.timestamp = None
-        self.pcpu_time = [None] * cpu_count
-        self.cpu_shares = None
-        self.pcpu_weight = [None] * cpu_count
+        self.pcpu_cfs_load = [None] * cpu_count
 
-        self.usage = "-"
-        self.pcpu_usage = ["-"] * cpu_count
-        self.shares = cpu_count
-        self.pcpu_shares = ["-"] * cpu_count
-        self.ntasks = "-"
-        self.pcpu_ntasks = ["-"] * cpu_count
-
-    def is_root(self):
-        return self.name == "root"
+        # view items
+        self.usage = None
+        self.pcpu_usage = [(None, None)] * cpu_count
+        self.shares = None
+        self.pcpu_shares = [(None, None)] * cpu_count
+        self.ntasks = None
+        self.pcpu_ntasks = [(None, None)] * cpu_count
 
     def add_child(self, child):
-        if self.level == max_level:
-            print("max_level reached, ignored %s" % child.path)
+        if self.level == MAX_LEVEL:
             return
 
         child.level = self.level + 1
+        child.parent = self
         self.children.append(child)
 
-    def update_usage(self):
-        base = "/sys/fs/cgroup/cpuacct"
-        path = "/".join([base, self.path, "cpuacct.usage_percpu"])
-        with open(path) as f:
-            pcpu_time = [int(x) for x in f.read().split()]
+    def read_cgroup_fs_usage(self):
+        path = "/sys/fs/cgroup/cpuacct" + self.path + "/cpuacct.usage_percpu"
+        try:
+            with open(path) as f:
+                pcpu_time = [int(x) for x in f.read().split()]
+        except:
+            print("failed to read", path)
+            return
 
         timestamp = int(time.time() * 10**9)
         pcpu_usage = [0] * cpu_count
-        if self.timestamp is not None:
-            delta = timestamp - self.timestamp
-            if delta == 0:
-                delta = 1
+        if self.last_timestamp is not None:
+            delta = timestamp - self.last_timestamp
             for i in range(cpu_count):
-                usage = pcpu_time[i] - self.pcpu_time[i]
-                if usage > delta:
-                    usage = delta
-                pcpu_usage[i] = usage / delta
+                usage = pcpu_time[i] - self.last_pcpu_time[i]
+                pcpu_usage[i] = percent(usage, delta)
 
-        self.timestamp = timestamp
-        self.pcpu_time = pcpu_time
+        self.last_timestamp = timestamp
+        self.last_pcpu_time = pcpu_time
 
-        usage = sum(pcpu_usage)
-        if usage == 0:
-            usage = 0.00001
-        self.usage = usage
-        self.pcpu_usage = ["%s/%s" % (pct(x), pct(x/usage)) for x in pcpu_usage]
+        self.usage = sum(pcpu_usage)
+        self.pcpu_usage = [(x, percent(x, self.usage)) for x in pcpu_usage]
 
-    def update_ntasks(self):
-        base = "/sys/fs/cgroup/cpu"
-        path = "/".join([base, self.path, "tasks"])
-        with open(path) as f:
-            self.ntasks = len(f.read().splitlines())
+    def read_cgroup_fs_shares(self):
+        path = "/sys/fs/cgroup/cpu" + self.path + "/cpu.shares"
+        try:
+            with open(path) as f:
+                self.shares = int(f.read())
+        except:
+            print("failed to read", path)
 
-    def update_cpu_shares(self):
-        base = "/sys/fs/cgroup/cpu"
-        path = "/".join([base, self.path, "cpu.shares"])
-        with open(path) as f:
-            self.cpu_shares = int(f.read())
+    def read_cgroup_fs_tasks(self):
+        path = "/sys/fs/cgroup/cpu" + self.path + "/tasks"
+        try:
+            with open(path) as f:
+                self.ntasks = len(f.read().splitlines())
+        except:
+            return
 
-    def update_pcpu_weight(self, cpu, cfs_info):
+    def read_cgroup_fs(self):
+        self.read_cgroup_fs_usage()
+        self.read_cgroup_fs_shares()
+        self.read_cgroup_fs_tasks()
+
+    def update_pcpu_ntasks(self, cpu, nrunning, ntasks):
+        self.pcpu_ntasks[cpu] = (nrunning, ntasks)
+
+    def collect_pcpu_cfs_info(self, cpu, cfs_info):
+        se_weight = None
+
         for line in cfs_info.splitlines():
             fields = line.split()
-            if fields[0] == ".se->load.weight":
-                self.pcpu_weight[cpu] = int(fields[2])
+            if fields[0] == ".load":
+                self.pcpu_cfs_load[cpu] = int(fields[2])
+            elif fields[0] == ".se->load.weight":
+                se_weight = int(fields[2])
 
-    def calc_shares(self, parent_shares, sibling_cpu_shares):
-        self.shares = parent_shares * self.cpu_shares / sibling_cpu_shares
+        if self.parent is not None:
+            self.pcpu_shares[cpu] = (
+                percent(se_weight, self.parent.pcpu_cfs_load[cpu]),
+                percent(se_weight, self.shares*1024),
+            )
 
-    def reset_pcpu_shares(self):
-        self.pcpu_shares = ["-"] * cpu_count
+    def info(self, view):
+        if view == VIEW_USAGE:
+            return self.usage
+        if view == VIEW_SHARES:
+            return self.shares
+        if view == VIEW_NTASKS:
+            return self.ntasks
+        raise Exception(view)
 
-    def update_stats(self):
-        self.reset_pcpu_shares()
-        self.update_usage()
-        self.update_cpu_shares()
-        self.update_ntasks()
+    def pcpu(self, view):
+        if view == VIEW_USAGE:
+            return self.pcpu_usage
+        if view == VIEW_SHARES:
+            return self.pcpu_shares
+        if view == VIEW_NTASKS:
+            return self.pcpu_ntasks
+        raise Exception(view)
 
-    def name(self):
-        return self.name
+def iter_task_groups(sort_id=None, view=None):
+    def _v(x):
+        if x is None:
+            return -1
+        return x
 
-    def usage(self):
-        return pct(self.usage)
+    key_f = None
+    if sort_id is not None:
+        if sort_id == 0:
+            key_f = lambda x: x.name
+        elif sort_id == 1:
+            key_f = lambda x: _v(x.info(view))
+        else:
+            key_f = lambda x: _v(x.pcpu(view)[sort_id-2][0])
 
-    def pcpu_usage(self, cpu):
-        return self.pcpu_usage[cpu]
+    def _iter(group):
+        yield group
 
-    def shares(self):
-        return pct(self.shares)
+        if group.fold:
+            return
 
-    def pcpu_shares(self, cpu):
-        return self.pcpu_shares[cpu]
+        children = group.children[:]
+        if key_f is not None:
+            children.sort(key=key_f, reverse=True)
 
-    def ntasks(self):
-        return self.ntasks
+        for child in children:
+            yield from _iter(child)
 
-    def pcpu_ntasks(self, cpu):
-        return self.pcpu_ntasks[cpu]
+    return _iter(task_groups["/"])
 
-def parse_sched_debug():
-    with open("/proc/sched_debug") as f:
+def toggle_task_group_fold(path):
+    changed = False
+    group = task_groups.get(path)
+    if group is not None:
+        group.fold = not group.fold
+        changed = True
+    return changed
+
+def unfold_all_task_groups():
+    changed = False
+    for group in iter_task_groups():
+        if group.fold:
+            group.fold = False
+            changed = True
+    return changed
+
+def collect_tasks(cpu, section):
+    tasks = defaultdict(lambda: [0, 0])
+
+    for line in section.splitlines():
+        fields = line.rsplit(" ", 1)
+        if fields[-1][0] == "/":
+            path = fields[-1]
+            tasks[path][1] += 1
+            if line[1] == "R":
+                tasks[path][0] += 1
+
+    for group in iter_task_groups():
+        ntasks = tasks[group.path]
+        group.update_pcpu_ntasks(cpu, ntasks[0], ntasks[1])
+
+def read_sched_debug():
+    cpu = 0
+    cfs_sections = defaultdict(dict)
+
+    try:
+        shutil.copyfile("/proc/sched_debug", tmp_sched_debug)
+    except Exception as e:
+        raise ExternalError(e)
+
+    with open(tmp_sched_debug) as f:
         for section in f.read().split("\n\n"):
             mo = CFS_RE.match(section)
             if mo is not None:
-                cpu, name = mo.groups()
-                group = task_groups.get(name)
-                if group is not None:
-                    group.update_pcpu_weight(int(cpu), section)
+                path = mo.group("path")
+                cpu = int(mo.group("cpu"))
+                cfs_sections[path][cpu] = section
+            elif section.startswith(TASKS_PREFIX):
+                collect_tasks(cpu, section)
 
-def update_task_groups():
+    for group in iter_task_groups():
+        for cpu, section in cfs_sections[group.path].items():
+            group.collect_pcpu_cfs_info(cpu, section)
+
+def read_cgroup_fs():
     global task_groups
 
     base = "/sys/fs/cgroup/cpu"
-    base_len = len(base)
-
     new_task_groups = dict()
-    for root, _, _ in os.walk(base):
-        path = root[len(base):]
+
+    for path, _, _ in os.walk(base):
+        path = chroot_path(path, base)
         group = task_groups.get(path)
         if group is None:
             group = TaskGroup(path)
-            if not group.is_root():
-                parts = path.rsplit("/", 1)
-                parent = new_task_groups[parts[0]]
-                parent.add_child(group)
+        else:
+            group.reset()
 
-        group.update_stats()
         new_task_groups[path] = group
+        if path != "/":
+            parent = new_task_groups[dirname(path)]
+            parent.add_child(group)
 
     task_groups = new_task_groups
 
-def calc_children_shares(group):
-    children_cpu_shares = sum(x.cpu_shares for x in group.children)
-    for child in group.children:
-        child.calc_shares(group.shares, children_cpu_shares)
-        calc_children_shares(child)
+    for group in iter_task_groups():
+        group.read_cgroup_fs()
 
 def get_sys_stats():
     with open("/proc/loadavg") as f:
@@ -187,234 +413,251 @@ def get_sys_stats():
             "ntasks": fields[3],
         }
 
-def iter_task_groups(group, info_f, cell_f, order):
-    line = "{0:<{width}}".format(group.level, width=level_width)
-    line += "{0:{width}}".format(group.name[:name_width], width=name_width)
-    line += "{0:{width}}".format(info_f(group), width=info_width)
-    for i in range(cpu_count):
-        line += "{0:>{width}}".format(cell_f(group, i), width=cell_width)
-    yield line
+class App:
+    def __init__(self, args):
+        sys.stdout = open(args.log, "w", buffering=1)
 
-    if order == ORDER_INFO:
-        key_f = info_f
-    else:
-        key_f = TaskGroup.name
+        self.interval = args.interval
+        self.last_update = 0
+        self.sys_stats = None
 
-    for child in sorted(group.children, key=key_f, reverse=True):
-        yield from iter_task_groups(child, info_f, cell_f, order)
+        self.help_mode = False
+        self.frozen = False
+        self.view_id = 0
+        self.sort_id = 0
 
-class Display:
-    def __init__(self, app, interval):
-        self.app = app
-
-        self.data = None
-        self.header = ""
-        self.tail = ""
+        self.header = None
+        self.tail = None
         self.lines = []
 
-        self.view = VIEW_USAGE
-        self.order = ORDER_INFO
-        self.frozen = False
-        self.mark_pos = 0
-        self.view_pos = 0
+        self.mark_path = "/"
+        self.top_pos = 0
+
         self.height = 0
         self.width = 0
-
-        self.last_update = 0
-        self.interval = interval
-        halfdelay = interval * 5
-        if halfdelay < 1:
-            halfdelay = 1
-        if halfdelay > 255:
-            halfdelay = 255
-
         self.stdscr = curses.initscr()
-        curses.noecho();
+
+    def start(self):
+        try:
+            self.screen_init()
+            self.run()
+        finally:
+            self.screen_cleanup()
+
+    def screen_init(self):
+        curses.noecho()
         curses.curs_set(0)
-        curses.halfdelay(halfdelay)
+        tenth = int(self.interval * 5)
+        if tenth < 1:
+            tenth = 1
+        if tenth > 255:
+            tenth = 255
+        curses.halfdelay(tenth)
         self.stdscr.keypad(1)
         self.stdscr.move(0, 0)
 
-    def should_update(self):
-        now = time.time()
-        return now - self.last_update > self.interval
-
-    def update_data(self):
-        self.data = self.app.get_stats()
-        self.last_update = time.time()
-
-    def update_content(self):
-        sys_stats, root_tg = self.data
-
-        header = "{0:{width}}".format("L", width=level_width)
-        header += "{0:{width}}".format("GROUP", width=name_width)
-        header += "{0:{width}}".format(self.view, width=info_width)
-        for i in range(cpu_count):
-            header += "{0:>{width}}".format("CPU%d" % i, width=cell_width)
-        self.header = header
-
-        tail = time.strftime("%H:%M:%S")
-        tail += " | " + "Ntasks: " + sys_stats["ntasks"]
-        tail += " | " + "Load avg: " + sys_stats["load_avg"]
-        tail += " | " + "View: " + self.view
-        if self.frozen:
-            tail += " | Frozen"
-        self.tail = tail
-
-        if self.view == VIEW_USAGE:
-            info_f = TaskGroup.usage
-            cell_f = TaskGroup.pcpu_usage
-        elif self.view == VIEW_SHARES:
-            info_f = TaskGroup.shares
-            cell_f = TaskGroup.pcpu_shares
-        else:
-            info_f = TaskGroup.ntasks
-            cell_f = TaskGroup.pcpu_ntasks
-
-        self.lines = list(iter_task_groups(root_tg, info_f, cell_f, self.order))
-
-    def cleanup(self):
+    def screen_cleanup(self):
         self.stdscr.keypad(0)
         curses.nocbreak()
         curses.echo()
         curses.endwin()
 
+    def show_help(self):
+        self.stdscr.clear()
+        self.stdscr.addstr(HELP_TEXT)
+
+    def update_stats(self):
+        now = time.time()
+        if now - self.last_update >= self.interval:
+            self.sys_stats = get_sys_stats()
+            read_cgroup_fs()
+            read_sched_debug()
+            self.update_content()
+            self.last_update = now
+
+    def update_content(self):
+        def _p(x):
+            if x is None:
+                return "-"
+            return x
+
+        view = views[self.view_id]
+
+        self.header = [
+            "{0:<{w}}".format("L", w=level_width),
+            "{0:<{w}}".format("GROUP", w=name_width),
+            "{0:>{w}}".format(view, w=info_width),
+        ] + [
+            "{0:>{w}}".format("CPU%d" % x, w=cell_width)
+            for x in range(cpu_count)
+        ]
+
+        self.lines = [(
+            group.path,
+            [
+                "{0:<{w}}".format(level_fold(group), w=level_width),
+                "{0:<{w}}".format(group.name[:name_width], w=name_width),
+                "{0:>{w}}".format(_p(group.info(view)), w=info_width),
+            ] + [
+                "{0:>{w}}".format("%s/%s" % (_p(a), _p(b)), w=cell_width)
+                for (a, b) in group.pcpu(view)
+            ])
+            for group in iter_task_groups(self.sort_id, view)
+        ]
+
+        fields = [
+            time.strftime("%H:%M:%S"),
+            "Ntasks: " + self.sys_stats["ntasks"],
+            "Load avg: " + self.sys_stats["load_avg"],
+            "View: %c-%s" % (self.view_id+ord("1"), view),
+        ]
+        if self.frozen:
+            fields.append("Frozen")
+        self.tail = [" | ".join(fields)]
+
+        self.redraw()
+
     def run(self):
-        self.update_data()
-        self.update_content()
         self.resize()
+        self.update_stats()
 
         while True:
             key = self.stdscr.getch()
-            if key in [curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
-                       curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END]:
+
+            if self.help_mode:
+                if key >= 0:
+                    self.help_mode = False
+                    self.update_content()
+                continue
+            if key == ord("h") or key == ord("H"):
+                self.help_mode = True
+                self.show_help()
+                continue
+
+            if key in [curses.KEY_UP, curses.KEY_DOWN,
+                       curses.KEY_PPAGE, curses.KEY_NPAGE,
+                       curses.KEY_HOME, curses.KEY_END]:
                 self.redraw(key)
             elif key == curses.KEY_RESIZE:
                 self.resize()
+                self.redraw()
             elif key == ord(">"):
-                self.order = ORDER_INFO
+                if self.sort_id < cpu_count + 1:
+                    self.sort_id += 1
                 self.update_content()
-                self.redraw()
             elif key == ord("<"):
-                self.order = ORDER_NAME
+                if self.sort_id > 0:
+                    self.sort_id -= 1
                 self.update_content()
-                self.redraw()
-            elif key == ord("c") or key == ord("C"):
-                self.view = VIEW_USAGE
-                self.update_content()
-                self.redraw()
-            elif key == ord("s") or key == ord("S"):
-                self.view = VIEW_SHARES
-                self.update_content()
-                self.redraw()
+            elif key == ord("\t"):
+                if toggle_task_group_fold(self.mark_path):
+                    self.update_content()
+            elif key == ord("u") or key == ord("U"):
+                if unfold_all_task_groups():
+                    self.update_content()
             elif key == ord("n") or key == ord("N"):
-                self.view = VIEW_NTASKS
+                self.view_id = (self.view_id + 1) % len(views)
                 self.update_content()
-                self.redraw()
+            elif key == ord("p") or key == ord("P"):
+                self.view_id = (self.view_id - 1) % len(views)
+                self.update_content()
+            elif key >= ord("1") and key <= ord("9"):
+                view_id = key - ord("1")
+                if view_id < len(views):
+                    self.view_id = view_id
+                    self.update_content()
             elif key == ord("f") or key == ord("F"):
                 self.frozen = not self.frozen
                 self.update_content()
-                self.redraw()
             elif key == ord("q") or key == ord("Q"):
                 break
 
-            if not self.frozen and self.should_update():
-                self.update_data()
-                self.update_content()
-                self.redraw()
+            if not self.frozen:
+                self.update_stats()
 
     def resize(self):
         self.height, self.width = self.stdscr.getmaxyx()
-        self.redraw()
 
-    def addline(self, line, attr=curses.A_NORMAL):
-        line = "{0:{width}}".format(line, width=self.width)
+    def addline(self, fields, attr=curses.A_NORMAL):
+        width = self.width
         try:
             self.stdscr.move(self.cursor_y, 0)
-            self.stdscr.addnstr(line, self.width, attr)
+            for i, field in enumerate(fields):
+                field_attr = attr
+                if i - 1 == self.sort_id:
+                    field_attr |= curses.A_BOLD
+                self.stdscr.addnstr(field, width, field_attr)
+                width -= len(field)
+            self.stdscr.addnstr(" "*width, width, attr)
             self.stdscr.clrtoeol()
-            self.cursor_y += 1
         except curses.error:
             pass
+        self.cursor_y += 1
+
+    def find_mark_pos(self):
+        last_pos = 0
+        for pos, (path, _) in enumerate(self.lines):
+            if self.mark_path.startswith(path):
+                last_pos = pos
+        return last_pos
 
     def redraw(self, key=None):
         self.cursor_y = 0
         self.addline(self.header, attr=curses.A_REVERSE|curses.A_BOLD)
 
-        doc_size = len(self.lines)
-        view_height = self.height - self.cursor_y - 1
-        if doc_size > 0 and view_height > 0:
+        nlines = len(self.lines)
+        height = self.height - 2
+        if nlines > 0 and height > 0:
+            mark_pos = self.find_mark_pos()
+            window = Window(nlines, height, self.top_pos, mark_pos)
+
             if key == curses.KEY_UP:
-                self.mark_pos -= 1
+                window.key_up()
             elif key == curses.KEY_DOWN:
-                self.mark_pos += 1
-            elif key == curses.KEY_PPAGE:
-                self.mark_pos -= view_height
-                self.view_pos -= view_height
-            elif key == curses.KEY_NPAGE:
-                self.mark_pos += view_height
-                self.view_pos += view_height
+                window.key_down()
             elif key == curses.KEY_HOME:
-                self.view_pos = 0
-                self.mark_pos = 0
+                window.key_home()
             elif key == curses.KEY_END:
-                self.view_pos = doc_size - 1
-                self.mark_pos = doc_size - 1
+                window.key_end()
+            elif key == curses.KEY_PPAGE:
+                window.key_ppage()
+            elif key == curses.KEY_NPAGE:
+                window.key_npage()
+            else:
+                window.refit()
 
-            if self.mark_pos < 0:
-                self.mark_pos = 0
-            elif self.mark_pos >= doc_size:
-                self.mark_pos = doc_size - 1
-            if self.view_pos > doc_size - view_height:
-                self.view_pos = doc_size - view_height
-            if self.view_pos < 0:
-                self.view_pos = 0
-            if self.view_pos > self.mark_pos:
-                self.view_pos = self.mark_pos
-            elif self.view_pos < self.mark_pos - view_height + 1:
-                self.view_pos = self.mark_pos - view_height + 1
+            self.top_pos = window.top
+            self.mark_path = self.lines[window.mark][0]
 
-            for line in self.lines[self.view_pos:self.view_pos + view_height]:
+            for path, line in self.lines[window.top:window.bottom]:
                 attr = curses.A_NORMAL
-                if line == self.lines[self.mark_pos]:
-                    attr = curses.A_BOLD
+                if path == self.mark_path:
+                    attr |= curses.A_BOLD
                 self.addline(line, attr)
 
         self.stdscr.clrtobot()
         self.cursor_y = self.height - 1
         self.addline(self.tail, attr=curses.A_REVERSE|curses.A_BOLD)
-        self.stdscr.refresh()
-
-class App:
-    def __init__(self, args):
-        sys.stdout = open(args.log, "w", buffering=1)
-
-        display = Display(self, args.interval)
-        try:
-            display.run()
-        finally:
-            display.cleanup()
-
-    def get_stats(self):
-        sys_stats = get_sys_stats()
-        update_task_groups()
-        parse_sched_debug()
-        calc_children_shares(task_groups[""])
-        return (sys_stats, task_groups[""])
 
 if __name__ == "__main__":
     import sys
     import argparse
 
+    def check_interval(value):
+        ivalue = float(value)
+        if ivalue < 0.1 or ivalue > 255:
+            raise argparse.ArgumentTypeError("interval must belong [0.1, 255]")
+        return ivalue
+
     parser = argparse.ArgumentParser(description="Task group top")
-    parser.add_argument("--interval", type=int, default=1,
+    parser.add_argument("--interval", type=check_interval, default=1,
                         help="refresh interval in seconds, default is 1")
-    parser.add_argument("--log", default="/tmp/tgtop.log",
+    parser.add_argument("--log", default=log_file,
                         help="write debug to file")
     args = parser.parse_args()
 
     try:
-        App(args)
+        App(args).start()
     except KeyboardInterrupt:
         sys.exit(2)
     except ExternalError as e:
