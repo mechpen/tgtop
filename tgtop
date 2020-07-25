@@ -649,7 +649,8 @@ if __name__ == "__main__":
             raise argparse.ArgumentTypeError("interval must belong [0.1, 255]")
         return ivalue
 
-    parser = argparse.ArgumentParser(description="Task group top")
+    parser = argparse.ArgumentParser(
+        description="Press 'h' at run time to see help.")
     parser.add_argument("--interval", type=check_interval, default=1,
                         help="refresh interval in seconds, default is 1")
     parser.add_argument("--log", default=log_file,
